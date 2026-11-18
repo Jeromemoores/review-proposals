@@ -6,6 +6,8 @@ import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { fileIdentity, normalizeText, sha256 } from '../core';
 import type { ReviewApi } from '../extension';
+import { publishProposal } from '../inbox';
+import { parseProposal } from '../core';
 
 export async function run(): Promise<void> {
   const temporary = process.env.REVIEW_PROPOSALS_TEST_ROOT!;
@@ -39,6 +41,13 @@ export async function run(): Promise<void> {
     for (const [doc, text] of [[a, originalA], [b, originalB]] as const) edit.replace(doc.uri, new vscode.Range(doc.positionAt(0), doc.positionAt(doc.getText().length)), text);
     assert.equal(await vscode.workspace.applyEdit(edit), true);
     await a.save(); await b.save(); await api.clear();
+  }
+  async function until(condition: () => boolean): Promise<void> {
+    const end = Date.now() + 8000;
+    while (!condition()) {
+      assert.ok(Date.now() < end, 'Timed out waiting for the observed editor state');
+      await new Promise(resolve => setTimeout(resolve, 40));
+    }
   }
   try {
     await importReview('preview');
@@ -87,10 +96,49 @@ export async function run(): Promise<void> {
     console.log('PASS: a changed disk target blocks every edit in the group.'); passed++;
     fs.writeFileSync(bPath, originalB);
 
+    await reset(); await importReview('cleanup', false);
+    await vscode.workspace.getConfiguration('reviewProposals').update('acceptedCleanupDelay', 0.15, vscode.ConfigurationTarget.Global);
+    await api.accept('group');
+    assert.deepEqual(api.visibleGroups(), ['group']);
+    await until(() => api.visibleGroups().length === 0);
+    assert.equal(api.session()?.savedDecisions().group, 'accepted');
+    assert.equal(normalizeText(a.getText()), 'export const a = 3;\n');
+    assert.equal(fs.readFileSync(aPath, 'utf8'), originalA);
+    await vscode.commands.executeCommand('reviewProposals.showAccepted');
+    assert.deepEqual(api.visibleGroups(), ['group']);
+    await api.importFile(path.join(temporary, 'cleanup.json'), root);
+    assert.deepEqual(api.visibleGroups(), [], 'Restored accepted time must not restart the cleanup countdown');
+    console.log('PASS: accepted cleanup hides only sidebar items, preserves decisions/edits and supports showing them again.'); passed++;
+
+    await vscode.workspace.getConfiguration('reviewProposals').update('acceptedCleanupDelay', 0, vscode.ConfigurationTarget.Global);
+    assert.deepEqual(api.visibleGroups(), ['group']);
+    console.log('PASS: a zero cleanup delay keeps accepted recommendations visible.'); passed++;
+
+    await reset();
+    const raw = JSON.parse(fs.readFileSync(path.join(temporary, 'cleanup.json'), 'utf8'));
+    raw.id = 'watched-publication'; raw.title = 'Automatically loaded review';
+    publishProposal(root, parseProposal(JSON.stringify(raw)));
+    await until(() => api.session()?.proposal.id === 'watched-publication');
+    assert.equal(a.getText(), originalA); assert.equal(a.isDirty, false);
+    assert.deepEqual(api.visibleGroups(), ['group']);
+    console.log('PASS: publishing through the inbox triggers the real watcher and loads recommendations without file selection or code edits.'); passed++;
+
+    await api.clear();
+    await vscode.commands.executeCommand('reviewProposals.loadLatest');
+    await until(() => api.session()?.proposal.id === 'watched-publication');
+    console.log('PASS: Show Latest Review restores the published review without opening a file picker.'); passed++;
+
+    await vscode.commands.executeCommand('reviewProposals.scm.focus');
+    await vscode.commands.executeCommand('reviewProposals.reject', { groupId: 'group', sessionKey: api.session()!.fingerprint });
+    await vscode.commands.executeCommand('reviewProposals.pending.focus');
+    assert.equal(api.session()?.savedDecisions().group, 'rejected');
+    assert.equal(a.getText(), originalA);
+    console.log('PASS: Source Control and dedicated review views use the same decisions without changing source.'); passed++;
+
     await vscode.commands.executeCommand('reviewProposals.installSkill');
     for (const agent of ['.claude', '.agents']) {
       const skill = path.join(home, agent, 'skills/propose-code-review');
-      for (const file of ['SKILL.md', 'scripts/core.js', 'scripts/create-proposal.cjs', 'proposal.schema.json']) assert.ok(fs.existsSync(path.join(skill, file)));
+      for (const file of ['SKILL.md', 'scripts/core.js', 'scripts/inbox.js', 'scripts/create-proposal.cjs', 'proposal.schema.json']) assert.ok(fs.existsSync(path.join(skill, file)));
       const replacement = path.join(temporary, 'replacement.ts'); fs.writeFileSync(replacement, 'export const a = 9;\n');
       const plan = { id: 'installed-' + agent, title: 'Installed helper review', groups: [{
         id: 'helper', title: 'A helper proposal', kind: 'refactor', priority: 'low', reason: 'Test the self-contained installed generator.',
@@ -101,6 +149,8 @@ export async function run(): Promise<void> {
       // Electron's executable is not a standalone Node CLI; use the runner's Node path.
       execFileSync(process.env.REVIEW_PROPOSALS_NODE!, [path.join(skill, 'scripts/create-proposal.cjs'), '--workspace', root, '--plan', planPath, '--output', output]);
       assert.equal(JSON.parse(fs.readFileSync(output, 'utf8')).groups[0].files[0].baseSha256, sha256(originalA));
+      execFileSync(process.env.REVIEW_PROPOSALS_NODE!, [path.join(skill, 'scripts/create-proposal.cjs'), '--workspace', root, '--plan', planPath, '--publish']);
+      await until(() => api.session()?.proposal.id === plan.id);
     }
     console.log('PASS: the companion skill installs and its standalone generator runs for both agents.'); passed++;
     console.log(`REVIEW_PROPOSALS_INTEGRATION: ${passed} checks passed; VS Code ${vscode.version}.`);

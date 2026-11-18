@@ -2,7 +2,7 @@
   "name": "review-proposals",
   "displayName": "Review Proposals",
   "description": "Review agent-proposed changes in a diff before applying them.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "Jeromemoores",
   "engines": {
     "vscode": "^1.100.0"
@@ -20,7 +20,8 @@
   },
   "main": "./out/extension.js",
   "activationEvents": [
-    "onView:reviewProposals.pending"
+    "onView:reviewProposals.pending",
+    "onView:reviewProposals.scm"
   ],
   "capabilities": {
     "untrustedWorkspaces": {
@@ -34,6 +35,18 @@
   },
   "contributes": {
     "commands": [
+      {
+        "command": "reviewProposals.loadLatest",
+        "title": "Show Latest Review",
+        "category": "Review Proposals",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "reviewProposals.showAccepted",
+        "title": "Show/Hide Accepted Recommendations",
+        "category": "Review Proposals",
+        "icon": "$(history)"
+      },
       {
         "command": "reviewProposals.import",
         "title": "Import Proposal",
@@ -101,64 +114,84 @@
           "id": "reviewProposals.pending",
           "name": "Recommendations"
         }
+      ],
+      "scm": [
+        {
+          "id": "reviewProposals.scm",
+          "name": "Proposed"
+        }
       ]
     },
     "viewsWelcome": [
       {
         "view": "reviewProposals.pending",
-        "contents": "Review proposed code changes before applying them.\n[Import a proposal](command:reviewProposals.import)\n[Copy agent instructions](command:reviewProposals.copyInstructions)\n[Install companion skill](command:reviewProposals.installSkill)",
+        "contents": "Completed agent reviews appear here automatically.\n[Show latest review](command:reviewProposals.loadLatest)\n[Copy agent review instructions](command:reviewProposals.copyInstructions)\n[Install companion skill](command:reviewProposals.installSkill)\n[Import an older proposal file](command:reviewProposals.import)",
+        "when": "!reviewProposals.hasReview"
+      },
+      {
+        "view": "reviewProposals.scm",
+        "contents": "Completed agent reviews appear here automatically.\n[Show latest review](command:reviewProposals.loadLatest)\n[Copy agent review instructions](command:reviewProposals.copyInstructions)\n[Install companion skill](command:reviewProposals.installSkill)\n[Import an older proposal file](command:reviewProposals.import)",
         "when": "!reviewProposals.hasReview"
       }
     ],
     "menus": {
       "view/title": [
         {
+          "command": "reviewProposals.loadLatest",
+          "when": "(view == reviewProposals.pending || view == reviewProposals.scm)",
+          "group": "navigation@1"
+        },
+        {
+          "command": "reviewProposals.showAccepted",
+          "when": "(view == reviewProposals.pending || view == reviewProposals.scm) && reviewProposals.hasReview"
+        },
+        {
           "command": "reviewProposals.import",
-          "when": "view == reviewProposals.pending",
-          "group": "navigation"
+          "when": "(view == reviewProposals.pending || view == reviewProposals.scm)",
+          "group": "tools"
         },
         {
           "command": "reviewProposals.refresh",
-          "when": "view == reviewProposals.pending",
+          "when": "(view == reviewProposals.pending || view == reviewProposals.scm)",
           "group": "navigation"
         },
         {
           "command": "reviewProposals.copyInstructions",
-          "when": "view == reviewProposals.pending"
+          "when": "(view == reviewProposals.pending || view == reviewProposals.scm)"
         },
         {
           "command": "reviewProposals.installSkill",
-          "when": "view == reviewProposals.pending"
+          "when": "(view == reviewProposals.pending || view == reviewProposals.scm)"
         },
         {
           "command": "reviewProposals.clear",
-          "when": "view == reviewProposals.pending && reviewProposals.hasReview"
+          "when": "(view == reviewProposals.pending || view == reviewProposals.scm) && reviewProposals.hasReview"
         }
       ],
       "view/item/context": [
         {
           "command": "reviewProposals.accept",
-          "when": "view == reviewProposals.pending && viewItem == reviewGroup.pending && isWorkspaceTrusted",
+          "when": "(view == reviewProposals.pending || view == reviewProposals.scm) && viewItem == reviewGroup.pending && isWorkspaceTrusted",
           "group": "inline@1"
         },
         {
           "command": "reviewProposals.reject",
-          "when": "view == reviewProposals.pending && viewItem == reviewGroup.pending",
+          "when": "(view == reviewProposals.pending || view == reviewProposals.scm) && viewItem == reviewGroup.pending",
           "group": "inline@2"
         },
         {
           "command": "reviewProposals.reject",
-          "when": "view == reviewProposals.pending && viewItem == reviewGroup.stale",
+          "when": "(view == reviewProposals.pending || view == reviewProposals.scm) && viewItem == reviewGroup.stale",
           "group": "inline@2"
         },
         {
           "command": "reviewProposals.details",
-          "when": "view == reviewProposals.pending && viewItem =~ /^reviewGroup/",
+          "when": "(view == reviewProposals.pending || view == reviewProposals.scm) && viewItem =~ /^reviewGroup/",
           "group": "inline@3"
         },
         {
           "command": "reviewProposals.preview",
-          "when": "view == reviewProposals.pending && viewItem == reviewFile"
+          "when": "(view == reviewProposals.pending || view == reviewProposals.scm) && viewItem == reviewFile"
         }
       ],
       "editor/title": [
@@ -178,6 +211,23 @@
           "group": "navigation@3"
         }
       ]
+    },
+    "configuration": {
+      "title": "Review Proposals",
+      "properties": {
+        "reviewProposals.autoImport": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically show completed agent reviews from the open workspace review inbox. Never applies code changes."
+        },
+        "reviewProposals.acceptedCleanupDelay": {
+          "type": "number",
+          "default": 10,
+          "minimum": 0,
+          "maximum": 3600,
+          "description": "Seconds before accepted recommendations disappear from the sidebar. Set 0 to keep them visible. Decisions are preserved; no source or proposal files are deleted."
+        }
+      }
     }
   },
   "scripts": {
@@ -186,7 +236,7 @@
     "test": "npm run compile && node --test out/test/*.test.js",
     "test:integration": "npm run compile && node tools/run-integration.cjs",
     "vscode:prepublish": "npm run compile",
-    "package": "vsce package --no-dependencies --skip-license --out dist/review-proposals-0.1.0.vsix"
+    "package": "vsce package --no-dependencies --skip-license --out dist/review-proposals-0.2.0.vsix"
   },
   "devDependencies": {
     "@types/node": "26.6.6",

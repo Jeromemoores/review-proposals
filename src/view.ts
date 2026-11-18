@@ -8,7 +8,7 @@ export class ReviewTree implements vscode.TreeDataProvider<ReviewNode>, vscode.D
   private readonly changed = new vscode.EventEmitter<ReviewNode | undefined>();
   readonly onDidChangeTreeData = this.changed.event;
   private statuses = new Map<string, Status>();
-  constructor(private readonly session: () => ReviewSession | undefined) {}
+  constructor(private readonly session: () => ReviewSession | undefined, private readonly hidden: (id: string) => boolean = () => false) {}
   refresh(): void {
     this.statuses.clear();
     const session = this.session();
@@ -18,7 +18,7 @@ export class ReviewTree implements vscode.TreeDataProvider<ReviewNode>, vscode.D
   getChildren(node?: ReviewNode): ReviewNode[] {
     const session = this.session();
     if (!session) return [];
-    if (!node) return session.proposal.groups.map(group => ({ groupId: group.id, sessionKey: session.fingerprint }));
+    if (!node) return session.proposal.groups.filter(group => !this.hidden(group.id)).map(group => ({ groupId: group.id, sessionKey: session.fingerprint }));
     if (node.filePath || node.sessionKey !== session.fingerprint) return [];
     return session.group(node.groupId).files.map(file => ({ ...node, filePath: file.path }));
   }

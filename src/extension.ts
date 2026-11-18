@@ -6,8 +6,9 @@ import { fileIdentity, MAX_BUNDLE_BYTES, parseProposal, readUtf8, ReviewSession,
 import { PreviewDocuments, ReviewNode, ReviewTree } from './view';
 import { editorPort } from './vscode-port';
 import { installCompanionSkill } from './install-skill';
+import { INBOX, newestPublishedReview } from './inbox';
 
-interface Remembered { source: string; root: string; fingerprint: string; decisions: Record<string, Decision> }
+interface Remembered { source: string; root: string; fingerprint: string; decisions: Record<string, Decision>; acceptedAt?: Record<string, number> }
 export interface ReviewApi {
   importFile(source: string, root: string): Promise<void>;
   session(): ReviewSession | undefined;
@@ -15,16 +16,46 @@ export interface ReviewApi {
   accept(groupId: string): Promise<void>;
   reject(groupId: string): Promise<void>;
   clear(): Promise<void>;
+  loadLatest(): Promise<void>;
+  visibleGroups(): string[];
 }
 
 export function activate(context: vscode.ExtensionContext): ReviewApi {
   let active: ReviewSession | undefined;
   let sourcePath: string | undefined;
   let persistence: Promise<void> = Promise.resolve();
-  const tree = new ReviewTree(() => active);
+  let acceptedAt: Record<string, number> = {};
+  let showAccepted = false;
+  let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
+  let autoTimer: ReturnType<typeof setTimeout> | undefined;
+  let autoLoading = false, disposed = false;
+  let lastAutoSignature: string | undefined;
+  const output = vscode.window.createOutputChannel('Review Proposals');
+  const tree = new ReviewTree(() => active, hidden);
   const previews = new PreviewDocuments();
   const view = vscode.window.createTreeView('reviewProposals.pending', { treeDataProvider: tree, showCollapseAll: true });
-  context.subscriptions.push(tree, previews, view, vscode.workspace.registerTextDocumentContentProvider('review-proposal', previews));
+  const scmView = vscode.window.createTreeView('reviewProposals.scm', { treeDataProvider: tree, showCollapseAll: true });
+  const views = [view, scmView];
+  context.subscriptions.push(tree, previews, ...views, output, vscode.workspace.registerTextDocumentContentProvider('review-proposal', previews), {
+    dispose() { disposed = true; if (cleanupTimer) clearTimeout(cleanupTimer); if (autoTimer) clearTimeout(autoTimer); }
+  });
+
+  function cleanupDelay(): number {
+    const delay = vscode.workspace.getConfiguration('reviewProposals').get<number>('acceptedCleanupDelay', 10);
+    return Number.isFinite(delay) && delay >= 0 && delay <= 3600 ? delay : 10;
+  }
+  function hidden(id: string): boolean {
+    const delay = cleanupDelay();
+    return !showAccepted && delay > 0 && active?.savedDecisions()[id] === 'accepted'
+      && Number.isFinite(acceptedAt[id]) && Date.now() - acceptedAt[id] >= delay * 1000;
+  }
+  function scheduleCleanup(): void {
+    if (cleanupTimer) clearTimeout(cleanupTimer);
+    const delay = cleanupDelay();
+    if (disposed || showAccepted || !delay) return;
+    const remaining = Object.values(acceptedAt).map(at => delay * 1000 - (Date.now() - at)).filter(ms => ms > 0);
+    if (remaining.length) cleanupTimer = setTimeout(refresh, Math.min(...remaining) + 5);
+  }
 
   function rootIsOpen(root: string): boolean {
     return !!vscode.workspace.workspaceFolders?.some(folder => {
@@ -34,7 +65,7 @@ export function activate(context: vscode.ExtensionContext): ReviewApi {
   }
   async function remember(): Promise<void> {
     const snapshot: Remembered | undefined = active && sourcePath ? {
-        source: sourcePath, root: active.root, fingerprint: active.fingerprint, decisions: active.savedDecisions()
+        source: sourcePath, root: active.root, fingerprint: active.fingerprint, decisions: active.savedDecisions(), acceptedAt: { ...acceptedAt }
     } : undefined;
     // Preserve invocation order even if the underlying storage completes asynchronously.
     persistence = persistence.catch(() => {}).then(() => context.workspaceState.update('reviewProposals.lastReview', snapshot));
@@ -42,9 +73,13 @@ export function activate(context: vscode.ExtensionContext): ReviewApi {
   }
   function refresh(): void {
     tree.refresh();
-    view.title = active ? active.proposal.title : 'Recommendations';
-    view.description = active ? `${active.proposal.groups.length} recommendation(s)` : undefined;
+    for (const targetView of views) {
+      targetView.title = targetView === scmView ? 'Proposed' : active ? active.proposal.title : 'Review Proposals';
+      targetView.description = active ? `${tree.getChildren().length} recommendation(s)` : undefined;
+      targetView.message = active && tree.getChildren().length === 0 ? 'Accepted recommendations are hidden. Use Show/Hide Accepted to revisit them.' : undefined;
+    }
     void vscode.commands.executeCommand('setContext', 'reviewProposals.hasReview', !!active);
+    scheduleCleanup();
   }
   async function importFile(source: string, root: string): Promise<void> {
     if (active?.busy) throw new Error('Wait for the current acceptance to finish before importing another review.');
@@ -54,7 +89,10 @@ export function activate(context: vscode.ExtensionContext): ReviewApi {
     const previous = context.workspaceState.get<Remembered>('reviewProposals.lastReview');
     if (previous?.fingerprint === next.fingerprint && fileIdentity(previous.root) === fileIdentity(next.root)) {
       active = new ReviewSession(root, proposal, previous.decisions);
-    } else active = next;
+      acceptedAt = Object.fromEntries(Object.entries(previous.acceptedAt ?? {}).filter(([, at]) => Number.isFinite(at) && at > 0));
+      for (const [id, decision] of Object.entries(active.savedDecisions())) if (decision === 'accepted' && !acceptedAt[id]) acceptedAt[id] = Date.now();
+    } else { active = next; acceptedAt = {}; }
+    showAccepted = false;
     sourcePath = path.resolve(source);
     previews.clear(); refresh(); await remember();
   }
@@ -70,7 +108,7 @@ export function activate(context: vscode.ExtensionContext): ReviewApi {
   async function accept(groupId: string): Promise<void> {
     if (!vscode.workspace.isTrusted) throw new Error('Trust the workspace before applying changes.');
     const session = requireSession();
-    try { await session.accept(groupId, editorPort); await remember(); }
+    try { await session.accept(groupId, editorPort); acceptedAt[groupId] = Date.now(); await remember(); }
     finally { refresh(); }
     void vscode.window.showInformationMessage(`Accepted “${session.group(groupId).title}” into editor buffers. Review, save and run checks when ready.`);
   }
@@ -79,7 +117,28 @@ export function activate(context: vscode.ExtensionContext): ReviewApi {
   }
   async function clear(): Promise<void> {
     if (active?.busy) throw new Error('Wait for the current acceptance to finish.');
-    active = undefined; sourcePath = undefined; previews.clear(); refresh(); await remember();
+    active = undefined; sourcePath = undefined; acceptedAt = {}; showAccepted = false; previews.clear(); refresh(); await remember();
+  }
+  function queueAutoImport(): void {
+    if (disposed || !vscode.workspace.getConfiguration('reviewProposals').get<boolean>('autoImport', true)) return;
+    if (autoTimer) clearTimeout(autoTimer);
+    autoTimer = setTimeout(() => { void loadLatest(); }, 200);
+  }
+  async function loadLatest(): Promise<void> {
+    if (disposed) return;
+    if (autoLoading || active?.busy) { queueAutoImport(); return; }
+    autoLoading = true;
+    try {
+      const roots = vscode.workspace.workspaceFolders?.filter(folder => folder.uri.scheme === 'file').map(folder => folder.uri.fsPath) ?? [];
+      const { review, issues } = newestPublishedReview(roots);
+      for (const issue of issues) output.appendLine(issue);
+      if (!review || (active && review.signature === lastAutoSignature)) return;
+      await importFile(review.source, review.root);
+      lastAutoSignature = review.signature;
+      const first = tree.getChildren()[0];
+      for (const targetView of views) if (targetView.visible && first) await targetView.reveal(first, { focus: false, select: false });
+    } catch (error) { output.appendLine(error instanceof Error ? error.message : String(error)); }
+    finally { autoLoading = false; }
   }
   async function chooseNode(argument?: unknown): Promise<ReviewNode | undefined> {
     const session = requireSession();
@@ -106,7 +165,7 @@ export function activate(context: vscode.ExtensionContext): ReviewApi {
     const folder = folders.length === 1 ? folders[0] : await vscode.window.showQuickPick(folders.map(folder => ({ label: folder.name, folder })), { title: 'Which workspace owns this proposal?' }).then(item => item?.folder);
     if (!folder) return;
     const files = await vscode.window.showOpenDialog({ canSelectMany: false, filters: { 'Review proposal': ['json'] }, defaultUri: folder.uri });
-    if (files?.[0]) { await importFile(files[0].fsPath, folder.uri.fsPath); await view.reveal(tree.getChildren()[0], { focus: true }); }
+    if (files?.[0]) { await importFile(files[0].fsPath, folder.uri.fsPath); const first = tree.getChildren()[0]; if (first) await view.reveal(first, { focus: true }); }
   });
   command('preview', async argument => {
     const node = await chooseNode(argument);
@@ -132,11 +191,15 @@ export function activate(context: vscode.ExtensionContext): ReviewApi {
   });
   command('accept', async argument => { const node = await chooseNode(argument); if (node) await accept(node.groupId); });
   command('reject', async argument => { const node = await chooseNode(argument); if (node) await reject(node.groupId); });
-  command('refresh', async () => refresh());
+  command('refresh', async () => { await loadLatest(); refresh(); });
+  command('loadLatest', loadLatest);
+  command('showAccepted', async () => { showAccepted = !showAccepted; refresh(); });
   command('clear', clear);
   command('copyInstructions', async () => {
     const helper = context.asAbsolutePath('tools/create-proposal.cjs');
-    const instructions = `Use review-and-repair-code to review the requested scope. Use propose-code-review if installed. Produce grouped recommendations with concrete reasons, documentation, tradeoffs and honest check results. Do not edit the target project files. Save proposed replacement files and a plan JSON outside the source tree, then run the proposal generator at ${JSON.stringify(helper)} with --workspace ROOT --plan PLAN.json --output NEW-PROPOSAL.json. Quote paths for the actual shell. Group dependent edits together; targets must be existing UTF-8 text files. The generator captures original contents and hashes. Import the generated proposal with Review Proposals: Import Proposal. Format instructions: ${context.asAbsolutePath('agent-skill/SKILL.md')}`;
+    const folders = vscode.workspace.workspaceFolders?.filter(folder => folder.uri.scheme === 'file') ?? [];
+    const workspace = folders.length === 1 ? JSON.stringify(folders[0].uri.fsPath) : 'ROOT';
+    const instructions = `Use review-and-repair-code to review the requested scope. Use propose-code-review if installed. Produce grouped recommendations with concrete reasons, documentation, tradeoffs and honest check results. Do not edit the target project files. Save proposed replacement files and a plan JSON outside the source tree, then run the proposal generator at ${JSON.stringify(helper)} with --workspace ${workspace} --plan PLAN.json --publish. ROOT must be the owning folder open in VS Code, not a nested package. Quote paths for the actual shell. Group dependent edits together; targets must be existing UTF-8 text files. The generator captures originals/hashes and atomically publishes to the local review inbox. Open Review Proposals or Source Control's Proposed section to see recommendations automatically; no manual import is needed. Format instructions: ${context.asAbsolutePath('agent-skill/SKILL.md')}`;
     await vscode.env.clipboard.writeText(instructions);
     void vscode.window.showInformationMessage('Agent review instructions copied. Paste them into your coding agent.');
   });
@@ -148,8 +211,13 @@ export function activate(context: vscode.ExtensionContext): ReviewApi {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const schedule = () => { if (timer) clearTimeout(timer); timer = setTimeout(refresh, 100); };
   context.subscriptions.push(vscode.workspace.onDidChangeTextDocument(schedule), vscode.window.onDidChangeWindowState(state => { if (state.focused) schedule(); }), { dispose() { if (timer) clearTimeout(timer); } });
+  const watcher = vscode.workspace.createFileSystemWatcher(`**/${INBOX}/*.json`);
+  context.subscriptions.push(watcher, watcher.onDidCreate(queueAutoImport), watcher.onDidChange(queueAutoImport), watcher.onDidDelete(queueAutoImport),
+    ...views.map(targetView => targetView.onDidChangeVisibility(event => { if (event.visible) queueAutoImport(); })),
+    vscode.workspace.onDidChangeWorkspaceFolders(queueAutoImport),
+    vscode.workspace.onDidChangeConfiguration(event => { if (event.affectsConfiguration('reviewProposals')) { refresh(); queueAutoImport(); } }));
   const last = context.workspaceState.get<Remembered>('reviewProposals.lastReview');
-  if (last && rootIsOpen(last.root)) void importFile(last.source, last.root).catch(() => { refresh(); });
-  else refresh();
-  return { importFile, session: () => active, preview, accept, reject, clear };
+  if (last && rootIsOpen(last.root)) void importFile(last.source, last.root).catch(() => { refresh(); }).finally(queueAutoImport);
+  else { refresh(); queueAutoImport(); }
+  return { importFile, session: () => active, preview, accept, reject, clear, loadLatest, visibleGroups: () => tree.getChildren().map(node => node.groupId) };
 }

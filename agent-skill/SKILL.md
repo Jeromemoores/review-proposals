@@ -13,11 +13,11 @@ Do not modify target source files to prepare a preview. Save full proposed repla
 
 Give each recommendation an independent purpose and group every required dependent edit together. An extraction and its caller updates belong to one group. Do not split a transaction or submit half a refactor. Search compatible existing behavior before suggesting a new helper. Mark performance reasoning as measured evidence, a code-supported opportunity, or an untested hypothesis; never invent benchmark results. Prefer a few concrete useful changes over a cleanup quota.
 
-Version 0.1 supports replacements of existing UTF-8 text files within one workspace. File creation/deletion/renaming, symlink/junction/hard-link targets, binary Unreal assets, and automatic code/test execution are outside this format. Keep those as clearly explained recommendations instead of fabricating an applicable patch. Changes inside .git are rejected. Unsupported recommendations can be reported in the agent's normal review response.
+Version 0.2 supports replacements of existing UTF-8 text files within one workspace. File creation/deletion/renaming, symlink/junction/hard-link targets, binary Unreal assets, and automatic code/test execution are outside this format. Keep those as clearly explained recommendations instead of fabricating an applicable patch. Changes inside .git are rejected. Unsupported recommendations can be reported in the agent's normal review response.
 
 ## Write the plan and generate a proposal
 
-The extension's **Install Companion Skill** command installs this file plus `scripts/create-proposal.cjs`, `scripts/core.js`, and `proposal.schema.json`. Node.js 22+ is needed to run the generator. In an extension checkout, run `npm ci` and `npm run compile`, then use `tools/create-proposal.cjs` instead. Resolve the helper from its actual location, not from the project being reviewed.
+The extension's **Install Companion Skill** command installs this file plus `scripts/create-proposal.cjs`, `scripts/core.js`, `scripts/inbox.js`, and `proposal.schema.json`. Node.js 22+ is needed to run the generator. In an extension checkout, run `npm ci` and `npm run compile`, then use `tools/create-proposal.cjs` instead. Resolve the helper from its actual location, not from the project being reviewed.
 
 Plan format (replacement paths are relative to the plan file; target paths are workspace-relative with forward slashes):
 
@@ -45,9 +45,11 @@ Plan format (replacement paths are relative to the plan file; target paths are w
 Run the generator with paths quoted for the current shell:
 
 ```text
-node "SKILL_DIR/scripts/create-proposal.cjs" --workspace "PROJECT_ROOT" --plan "TEMP_DIR/plan.json" --output "TEMP_DIR/review-proposal.json"
+node "SKILL_DIR/scripts/create-proposal.cjs" --workspace "PROJECT_ROOT" --plan "TEMP_DIR/plan.json" --publish
 ```
 
-The helper reads originals, normalizes UTF-8 BOM/CRLF for comparison, computes hashes, validates the grouped result, and exclusively creates a new output file. It does not edit target files or overwrite an existing output. Choose a fresh proposal filename when regenerating. Do not hand-invent original contents or hashes to bypass staleness checks.
+Use `--publish` by default for extension reviews. `PROJECT_ROOT` must be the owning filesystem folder open in VS Code, even when the affected package is nested. The helper atomically writes a unique completed review into `.review-proposals/inbox/` under that root. Clicking Review Proposals or opening Source Control's Proposed section automatically discovers it; an already active extension also watches for new publications. No file picker is needed. Proposals contain source text; keep the local inbox out of version control according to the project's conventions. For a deliberate standalone export, use `--output "TEMP_DIR/review-proposal.json"` instead of `--publish` and use Import Proposal.
 
-Return the proposal path, concise findings/recommendations and actual verification gaps. The user imports it with **Review Proposals: Import Proposal**. Accept/Reject belongs to the user; do not invoke acceptance commands or modify files after producing a proposal unless separately authorized. When the source changes, regenerate from current evidence rather than silently rebasing a reviewed change.
+The helper reads originals, normalizes UTF-8 BOM/CRLF for comparison, computes hashes, and validates the grouped result. It does not edit target files or overwrite an existing export. Do not hand-invent original contents or hashes to bypass staleness checks.
+
+Return the published path, concise findings/recommendations and actual verification gaps. Tell the user to open Review Proposals; do not require manual import for a publication. Accepted items hide from the sidebar after the configured delay (10 seconds by default); decisions remain saved, and Show/Hide Accepted Recommendations restores visibility. Hiding an item does not save, test, commit, undo or delete source. Accept/Reject belongs to the user; do not invoke acceptance commands or modify files after producing a proposal unless separately authorized. When the source changes, regenerate from current evidence rather than silently rebasing a reviewed change.
