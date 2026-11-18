@@ -1,0 +1,14 @@
+.git/**
+.local/**
+.vscode-test/**
+.test-workspace/**
+node_modules/**
+src/**
+out/test/**
+out/integration/**
+out/**/*.map
+dist/**
+tools/run-integration.cjs
+tsconfig.json
+package-lock.json
+**/*.log

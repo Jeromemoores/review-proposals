@@ -1,0 +1,16 @@
+{
+  "id": "example-price-review",
+  "title": "Price calculation review",
+  "groups": [{
+    "id": "extract-total",
+    "title": "Separate calculation from presentation",
+    "kind": "refactor",
+    "priority": "low",
+    "reason": "The same function calculates the total and formats its display string. Extracting the calculation creates a reusable, directly testable boundary.",
+    "benefit": "Callers can work with integer cents without parsing a formatted currency string. This is a structural improvement, not a measured speedup.",
+    "tradeoffs": "The extra public function should be retained only if reuse or focused tests justify the boundary. Preserve the current rounding and formatting behavior.",
+    "documentation": [],
+    "checks": [{ "description": "Compare formatted totals for zero, multiple items and fractional-cent inputs before accepting.", "status": "not-run" }],
+    "files": [{ "path": "price.ts", "proposedFile": "price.proposed.ts" }]
+  }]
+}
